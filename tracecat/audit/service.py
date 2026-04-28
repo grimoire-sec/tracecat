@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import Coroutine
+from typing import Any
 
 import httpx
 from sqlalchemy import select
@@ -10,6 +13,16 @@ from tracecat.audit.types import AuditAction, AuditEvent, AuditResourceType
 from tracecat.contexts import ctx_client_ip
 from tracecat.db.models import User
 from tracecat.service import BaseService
+
+# Retain references to in-flight webhook tasks so they aren't garbage
+# collected before completion (per asyncio.create_task docs).
+_PENDING_WEBHOOK_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _spawn_webhook_task(coro: Coroutine[Any, Any, None]) -> None:
+    task = asyncio.create_task(coro)
+    _PENDING_WEBHOOK_TASKS.add(task)
+    task.add_done_callback(_PENDING_WEBHOOK_TASKS.discard)
 
 
 class AuditService(BaseService):
@@ -97,7 +110,11 @@ class AuditService(BaseService):
             status=status,
             ip_address=ctx_client_ip.get(),
         )
-        await self._post_event(webhook_url=webhook_url, payload=payload)
+        # Dispatch the webhook POST as a background task so a slow or
+        # unreachable audit endpoint does not block the request path.
+        _spawn_webhook_task(
+            self._post_event(webhook_url=webhook_url, payload=payload)
+        )
         self.logger.debug(
-            "Streamed audit event", resource_type=resource_type, action=action
+            "Scheduled audit event", resource_type=resource_type, action=action
         )
